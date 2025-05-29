@@ -5,6 +5,7 @@ import re
 import numpy as np
 from datetime import datetime
 import random
+import logging
 
 def collect_matches(soup):
     player1, player2, winner = [], [], []
@@ -51,65 +52,102 @@ def collect_tourney_data(index, tournaments_df) -> pd.DataFrame:
     return df
 
 def add_players(index, tournaments_df):
+    logging.basicConfig(
+    level=logging.INFO,                          # Minimum log level
+    format='%(asctime)s - %(levelname)s - %(message)s',  # Log format
+    filename='adding_players.log',                          # Optional: log to a file
+    filemode='w'                                 # Optional: 'w' to overwrite, 'a' to append
+    )
     name, id, year = index[0].lower(), tournaments_df.loc[index, 'Id'][0], index[1]
-    url = "https://www.atptour.com/en/scores/archive/%s/%s/%d/results" % (name, id, year)
-    page = requests.get(url).text
+    url = "https://www.atptour.com/en/scores/archive/%s/%s/%s/results" % (name, id, year)
+    try:
+        page = requests.get(url, timeout=10).text
+    except Exception as e:
+        logging.error(f'Adding players failed for {(name, id, year)} with error {str(e)}')
+        return None
+    page = page[page.find('<option selected="selected" value="">Player (All)</option>'):]
+    page = page[:page.find('</select>')]
+
     soup = BeautifulSoup(page, features="lxml")
+
     def custom_selector(tag):
-        if tag.name == 'li' and tag.has_attr('data-value'):
+        if tag.name == 'option' and tag.has_attr('value') and not tag.has_attr('selected'):
             return True
         return False
     #Gets rid of country tags
-    tags = [tag for tag in soup.find_all(custom_selector) if bool(re.search(r'\d', tag.get('data-value')))]
-    #Removing tags that are not names
-    names, ids = [], []
-    for tag in enumerate(reversed(tags)):
-        tag = str(tag[1])
-        ue = tag.find('ue')
-        id = tag[ue + 4: ue + 8]
-        tag = tag[tag.find('>')+1:]
-        name = tag[:tag.find('<')]
-        if 'Round' in tag:
-            break
-        else:
-            names.append(name)
-            ids.append(id)
+    names = [tag.text for tag in soup.find_all(custom_selector)]
+    ids = [tag.get('value') for tag in soup.find_all(custom_selector)]
     return pd.DataFrame({'Name' : names, 'Id' : ids})
 
-def collect_tournaments(year):    
+def collect_tournaments(year):
+    logging.basicConfig(
+    level=logging.INFO,                          # Minimum log level
+    format='%(asctime)s - %(levelname)s - %(message)s',  # Log format
+    filename='app.log',                          # Optional: log to a file
+    filemode='w'                                 # Optional: 'w' to overwrite, 'a' to append
+    )
+
     tournaments_page = 'https://www.atptour.com/en/scores/results-archive?year=%d' % (year)
-    tags, names, numbers, start_date, end_date, surfaces = [], [], [], [], [], []
+    tags, names, numbers, start_dates, end_dates = [], [], [], [], []
     page = requests.get(tournaments_page).text
+
+    start = page.find('<select id="tournament"')
+    tournament_string = page[start:]
+    end = tournament_string.find('</select>')
+
+    tournament_string = tournament_string[:end]
     soup = BeautifulSoup(page, features="lxml")
+
     def custom_selector(tag):
-        if tag.name == 'li' and tag.has_attr("data-value") and tag.has_attr('class'):
+        if tag.name == 'option' and tag.has_attr("value") and tag.has_attr('class'):
             return True
         return False
     for tag in soup.find_all(custom_selector):
         tags.append(tag)
-    tags = tags[110:-7]
     for tag in tags:
-        url_number = int(tag.get('data-value'))
+        url_number = int(tag.get('value'))
         tag = str(tag)
         tag = tag[tag.find('>') + 1:]
         name = tag[:tag.find('<')].strip().title()
         names.append(name)
-        print(name)
         numbers.append(url_number)
+
     for i in range(len(names)):
         name, num = names[i], numbers[i]
-        print(name, num)
-        url = 'https://www.atptour.com/en/scores/archive/%s/%d/%d/results' % (name, num, year)
-        page = requests.get(url).text
-        soup1 = BeautifulSoup(page, features="html.parser")
-        for tag in soup1.find_all('span', {'class' : 'tourney-dates'}):
-            tag = str(tag)
-            tag = tag[tag.find('>')+1:]
-            tag = tag[:tag.find('<')].strip()
-            dates = [date.strip() for date in tag.split('-')]
-        start_date.append(datetime.strptime(dates[0], '%Y.%m.%d'))
-        end_date.append(datetime.strptime(dates[1], '%Y.%m.%d'))
-    tournaments = pd.DataFrame({'Name' : names, 'Id' : numbers, 'Start Date' : start_date, 'End Date' : end_date, 'Surface' : surfaces})
+        name = name.replace(" ", "-")
+        print(name, num, year)
+        url = 'https://www.atptour.com/en/scores/archive/%s/%s/%s/results' % (name, num, year)
+        try:
+            page = requests.get(url, timeout = 10).text
+            soup1 = BeautifulSoup(page, features="html.parser")
+            date_location = soup1.find_all('div', class_='date-location')[1]
+        except Exception as e:
+            logging.error(f'Scraping failed for {(name, num, year)} with error {str(e)}')
+
+        text = date_location.get_text(strip=True)
+        # Regex to match patterns like: 27 Feb - 4 Mar, 2023
+        match = re.search(r'(\d{1,2} \w{3}) - (\d{1,2} \w{3}), (\d{4})', text)
+
+        match2 = re.search(r'(\d{1,2})-(\d{1,2}) (\w{3}), (\d{4})', text)
+        
+        if match:
+            start_day = match.group(1)
+            end_day = match.group(2)
+            year = match.group(3)
+            start_date = f"{start_day}, {year}"
+            end_date = f"{end_day}, {year}"
+        elif match2:
+            start_day = match2.group(1)
+            end_day = match2.group(2)
+            month = match2.group(3)
+            year = match2.group(4)
+            start_date = f"{start_day} {month}, {year}"
+            end_date = f"{end_day} {month}, {year}"
+        else:
+            raise Exception("Date format could not be parsed. Check website and add regex.")
+        start_dates.append(datetime.strptime(start_date, "%d %b, %Y"))
+        end_dates.append(datetime.strptime(end_date, "%d %b, %Y"))
+    tournaments = pd.DataFrame({'Name' : names, 'Id' : numbers, 'Start Date' : start_dates, 'End Date' : end_dates})
     return tournaments
 
 def find_ranking(row, tournaments_df, players_df, player1 = True):
