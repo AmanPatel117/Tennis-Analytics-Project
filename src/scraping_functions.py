@@ -39,13 +39,40 @@ def collect_scores(soup):
     return scores
 
 def collect_tourney_data(index, tournaments_df) -> pd.DataFrame:
-    name, id, year = index[0].lower(), tournaments_df.loc[index, 'Id'][0], index[1]
+    logging.basicConfig(
+    level=logging.INFO,                          # Minimum log level
+    format='%(asctime)s - %(levelname)s - %(message)s',  # Log format
+    filename='adding_players.log',                          # Optional: log to a file
+    filemode='w'                                 # Optional: 'w' to overwrite, 'a' to append
+    )
+    name, id, year = index[0].lower(), tournaments_df.loc[index, 'Id'].iloc[0], index[1]
     url = "https://www.atptour.com/en/scores/archive/%s/%s/%d/results" % (name, id, year)
-    page = requests.get(url).text
+    print(url)
+    try:
+        page = requests.get(url, timeout = 10).text
+    except Exception as e:
+        logging.error(f'Collecting match data for {(name, id, year)} failed with error {str(e)}')
+        return None
     soup = BeautifulSoup(page, features="lxml")
-    player1, player2, winner= collect_matches(soup)
-    scores = collect_scores(soup)
-    df = pd.DataFrame({'Player 1' : player1, 'Player 2' : player2, 'Winner' : winner, 'Score' : scores})
+
+    def match_selector(tag):
+        return tag.name == 'div' and tag.has_attr('class') and 'match-stats' in tag['class']
+    
+    def player_selector(tag):
+        return tag.name == 'a' and tag.has_attr('href')
+    
+    match_tags = soup.find_all(match_selector)
+
+    player1, player2, winners = [], [], []
+    for match_tag in match_tags:
+        players = [player_tag.text for player_tag in match_tag.find_all(player_selector)]
+        if players == []:
+            continue
+        player1.append(players[0])
+        player2.append(players[1])
+        winners.append(players[0])
+        
+    df = pd.DataFrame({'Player 1' : player1, 'Player 2' : player2, 'Winner' : winners})
     df['Tournament Name'] = name.title()
     df = df[df['Player 2'] != 'Bye']
     df['Year'] = year
@@ -58,7 +85,7 @@ def add_players(index, tournaments_df):
     filename='adding_players.log',                          # Optional: log to a file
     filemode='w'                                 # Optional: 'w' to overwrite, 'a' to append
     )
-    name, id, year = index[0].lower(), tournaments_df.loc[index, 'Id'][0], index[1]
+    name, id, year = index[0].lower(), tournaments_df.loc[index, 'Id'].iloc[0], index[1]
     url = "https://www.atptour.com/en/scores/archive/%s/%s/%s/results" % (name, id, year)
     try:
         page = requests.get(url, timeout=10).text
@@ -71,9 +98,7 @@ def add_players(index, tournaments_df):
     soup = BeautifulSoup(page, features="lxml")
 
     def custom_selector(tag):
-        if tag.name == 'option' and tag.has_attr('value') and not tag.has_attr('selected'):
-            return True
-        return False
+        return tag.name == 'option' and tag.has_attr('value') and not tag.has_attr('selected') 
     #Gets rid of country tags
     names = [tag.text for tag in soup.find_all(custom_selector)]
     ids = [tag.get('value') for tag in soup.find_all(custom_selector)]
