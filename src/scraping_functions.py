@@ -6,37 +6,8 @@ import numpy as np
 from datetime import datetime
 import random
 import logging
+from requests_html import AsyncHTMLSession
 
-def collect_matches(soup):
-    player1, player2, winner = [], [], []
-    index = 0
-    for tag in soup.find_all('td', {'class' : 'day-table-name'}):
-        tag = str(tag)
-        if '<a' in tag:
-            tag = tag[tag.find('>') + 1:]
-            tag = tag[tag.find('>') + 1:]
-            name = tag[:tag.find('<')]
-        else:
-            tag = tag[tag.find('>') + 1:]
-            name = tag[:tag.find('<')].strip()
-        if index % 2 == 0:
-            player1.append(name)
-            winner.append(name)
-        else:
-            player2.append(name)
-        index += 1
-    return player1, player2, winner
-
-def collect_scores(soup):
-    scores = []
-    for tag in soup.find_all('td', {'class' : 'day-table-score'}):
-        tag = str(tag)
-        score = ''
-        while '-->' in tag:
-            tag = tag[tag.find('-->') + 5:]
-            score += tag[:2]
-        scores.append(score)
-    return scores
 
 def collect_tourney_data(index, tournaments_df) -> pd.DataFrame:
     logging.basicConfig(
@@ -175,50 +146,69 @@ def collect_tournaments(year):
     tournaments = pd.DataFrame({'Name' : names, 'Id' : numbers, 'Start Date' : start_dates, 'End Date' : end_dates})
     return tournaments
 
-def find_ranking(row, tournaments_df, players_df, player1 = True):
+async def find_ranking(row, tournaments_df, players_df, player1 = True):
     name = row['Player 1'] if player1 else row['Player 2']
     tournament, year = row['Tournament Name'], row['Year']
-    tournament_id = tournaments_df.loc[(tournament, year), 'Id'][0]
-    try:
-        url = 'https://www.atptour.com/en/scores/archive/%s/%d/%d/results' % (tournament.lower(), tournament_id, year)
-        page = requests.get(url).text
-    except Exception as e:
-        return -1
-    soup = BeautifulSoup(page, features="lxml")
 
-    start_date = tournaments_df.loc[(tournament, year), 'Start Date'][0]
+    start_date = tournaments_df.loc[(tournament, year), 'Start Date'].iloc[0]
+    print(start_date)
     try:
         name, player_id = name.lower().replace(" ", '-'), players_df.loc[name, 'Id']
     except Exception as e:
+        print('hi')
         print(e)
         return -1
-    ranking_page = 'https://www.atptour.com/en/players/%s/%s/rankings-history' % (name, player_id)
-    historical_ranking = requests.get(ranking_page).text
-    soup1 = BeautifulSoup(historical_ranking, features="lxml")
+    ranking_page_url = 'https://www.atptour.com/en/players/%s/%s/rankings-history?year=all' % (name, player_id)
+    print(ranking_page_url)
+    from selenium import webdriver
+    from selenium.webdriver.chrome.options import Options
+    from selenium.webdriver.common.by import By
+    from selenium.webdriver.support.ui import WebDriverWait
+    from selenium.webdriver.support import expected_conditions as EC
 
-    dates, contents, format = [], [], '%Y.%m.%d'
-    date_to_ranking = {}
-    for tag in soup1.find_all('td'):
-        tag = str(tag)[4:]
-        content = tag[:tag.find('<')].strip()
-        contents.append(content)
-    for index, content in enumerate(contents):
-        try:
-            date = datetime.strptime(content, format)
-            dates.append(date)
-            ranking = int(contents[index + 1])
-            date_to_ranking[content] = ranking
-        except:
-            continue
+    from bs4 import BeautifulSoup
 
-    ranking_date = -1
-    start_date = datetime.strptime(start_date, '%Y-%m-%d')
-    for index, date in enumerate(dates):
-        if date <= start_date:
-            ranking_date = date
-            break
+    # Setup Chrome in headless mode
+    options = Options()
+    options.add_argument("--headless")
+    driver = webdriver.Chrome(options=options)
+
     try:
-        ranking = date_to_ranking[datetime.strftime(ranking_date, format)]
-    except:
-        return -1
-    return ranking
+        driver.get(ranking_page_url)
+
+        # Wait for the rankings table items to load
+        WebDriverWait(driver, 20).until(
+            EC.presence_of_element_located((By.CSS_SELECTOR, "div.ranking-item"))
+        )
+
+        print("Ranking items loaded!")
+
+        # Get page source after JS execution
+        html = driver.page_source
+
+        # Parse with BeautifulSoup
+        soup = BeautifulSoup(html, "html.parser")
+        ranking_items = soup.select("div.ranking-item")
+
+        print("Date         | Rank | Points")
+        print("-------------------------------")
+        
+        for item in ranking_items:
+            type_ = item.select_one("dd.type")
+            if type_ and type_.get_text(strip=True) != "Singles":
+                continue  # Skip doubles
+
+            date = item.select_one("dd.name span")
+            rank = item.select_one("dd.rank div")
+            points = item.select_one("dd.points div.set-points div")
+
+            date_text = date.get_text(strip=True) if date else "N/A"
+            rank_text = rank.get_text(strip=True) if rank else "N/A"
+            points_text = points.get_text(strip=True) if points else "N/A"
+
+            print(f"{date_text} | {rank_text:>4} | {points_text}")
+
+    except Exception as e:
+        print("Error:", e)
+    finally:
+        driver.quit()

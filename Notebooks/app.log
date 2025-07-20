@@ -1,0 +1,13 @@
+2025-06-14 14:28:12,086 - ERROR - Scraping failed for ('Davis-Cup-Qualifiers-And-Groups-I-&Amp;-Ii-Playoffs', 8096, '2022') with error list index out of range
+2025-06-14 14:31:27,059 - ERROR - Scraping failed for ('Vienna', 337, '2019') with error HTTPSConnectionPool(host='www.atptour.com', port=443): Read timed out. (read timeout=10)
+2025-06-14 14:34:06,793 - ERROR - Scraping failed for ('Stockholm', 429, '2016') with error HTTPSConnectionPool(host='www.atptour.com', port=443): Read timed out. (read timeout=10)
+2025-06-14 14:34:57,927 - ERROR - Scraping failed for ('Rio-De-Janeiro', 6932, '2015') with error HTTPSConnectionPool(host='www.atptour.com', port=443): Read timed out. (read timeout=10)
+2025-06-14 14:44:49,574 - ERROR - Scraping failed for ('Bogota', 359, '2002') with error list index out of range
+2025-06-14 14:44:59,125 - ERROR - Scraping failed for ('Shanghai', 890, '2002') with error list index out of range
+2025-06-14 14:45:00,641 - ERROR - Scraping failed for ('Stuttgart', 357, '2002') with error list index out of range
+2025-06-14 14:49:10,814 - ERROR - Adding players failed for ('davis cup', 8099, 2013) with error HTTPSConnectionPool(host='www.atptour.com', port=443): Read timed out. (read timeout=10)
+2025-06-14 14:51:49,782 - ERROR - Adding players failed for ('long island', 441, 2002) with error HTTPSConnectionPool(host='www.atptour.com', port=443): Read timed out. (read timeout=10)
+2025-06-14 14:51:59,827 - ERROR - Adding players failed for ('long island', 441, 2002) with error HTTPSConnectionPool(host='www.atptour.com', port=443): Read timed out. (read timeout=10)
+2025-06-14 14:55:31,422 - ERROR - Adding players failed for ('san jose', 424, 2002) with error HTTPSConnectionPool(host='www.atptour.com', port=443): Read timed out. (read timeout=10)
+2025-06-14 14:55:41,475 - ERROR - Adding players failed for ('san jose', 424, 2002) with error HTTPSConnectionPool(host='www.atptour.com', port=443): Read timed out. (read timeout=10)
+2025-06-14 14:58:06,825 - ERROR - Adding players failed for ('washington', 418, 2006) with error HTTPSConnectionPool(host='www.atptour.com', port=443): Read timed out. (read timeout=10)
