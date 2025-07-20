@@ -2,11 +2,15 @@ import requests
 from bs4 import BeautifulSoup
 import pandas as pd
 import re
-import numpy as np
 from datetime import datetime
 import random
 import logging
-from requests_html import AsyncHTMLSession
+from selenium import webdriver
+from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.common.by import By
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
+from bs4 import BeautifulSoup
 
 
 def collect_tourney_data(index, tournaments_df) -> pd.DataFrame:
@@ -146,27 +150,13 @@ def collect_tournaments(year):
     tournaments = pd.DataFrame({'Name' : names, 'Id' : numbers, 'Start Date' : start_dates, 'End Date' : end_dates})
     return tournaments
 
-async def find_ranking(row, tournaments_df, players_df, player1 = True):
-    name = row['Player 1'] if player1 else row['Player 2']
-    tournament, year = row['Tournament Name'], row['Year']
-
-    start_date = tournaments_df.loc[(tournament, year), 'Start Date'].iloc[0]
-    print(start_date)
+async def collect_rankings(name, players_df):
     try:
-        name, player_id = name.lower().replace(" ", '-'), players_df.loc[name, 'Id']
+        url_name, player_id = name.lower().replace(" ", '-'), players_df.loc[name, 'Id']
     except Exception as e:
-        print('hi')
         print(e)
         return -1
-    ranking_page_url = 'https://www.atptour.com/en/players/%s/%s/rankings-history?year=all' % (name, player_id)
-    print(ranking_page_url)
-    from selenium import webdriver
-    from selenium.webdriver.chrome.options import Options
-    from selenium.webdriver.common.by import By
-    from selenium.webdriver.support.ui import WebDriverWait
-    from selenium.webdriver.support import expected_conditions as EC
-
-    from bs4 import BeautifulSoup
+    ranking_page_url = 'https://www.atptour.com/en/players/%s/%s/rankings-history?year=all' % (url_name, player_id)
 
     # Setup Chrome in headless mode
     options = Options()
@@ -175,14 +165,10 @@ async def find_ranking(row, tournaments_df, players_df, player1 = True):
 
     try:
         driver.get(ranking_page_url)
-
         # Wait for the rankings table items to load
         WebDriverWait(driver, 20).until(
             EC.presence_of_element_located((By.CSS_SELECTOR, "div.ranking-item"))
         )
-
-        print("Ranking items loaded!")
-
         # Get page source after JS execution
         html = driver.page_source
 
@@ -190,25 +176,58 @@ async def find_ranking(row, tournaments_df, players_df, player1 = True):
         soup = BeautifulSoup(html, "html.parser")
         ranking_items = soup.select("div.ranking-item")
 
-        print("Date         | Rank | Points")
-        print("-------------------------------")
-        
+        ranks, dates = [], []
+
         for item in ranking_items:
             type_ = item.select_one("dd.type")
             if type_ and type_.get_text(strip=True) != "Singles":
                 continue  # Skip doubles
 
             date = item.select_one("dd.name span")
-            rank = item.select_one("dd.rank div")
-            points = item.select_one("dd.points div.set-points div")
+            rank = item.select_one("dd.points div.set-points div")
 
             date_text = date.get_text(strip=True) if date else "N/A"
             rank_text = rank.get_text(strip=True) if rank else "N/A"
-            points_text = points.get_text(strip=True) if points else "N/A"
 
-            print(f"{date_text} | {rank_text:>4} | {points_text}")
+            dates.append(pd.to_datetime(date_text).date())
+            ranks.append(int(rank_text))
 
+        df = pd.DataFrame()
+        df['Player'] = [name] * (len(dates))
+        df['Date'] = dates
+        df['Rank'] = ranks
     except Exception as e:
         print("Error:", e)
+        return None
     finally:
         driver.quit()
+    return df.drop_duplicates(subset='Date')
+
+def add_surfaces(tournaments_df):
+    def custom_selector(tag):
+        # Check if tag is an <li>
+        if tag.name == 'li':
+            # Look for a <span> child with exact text 'Surface'
+            span = tag.find('span')
+            if span and span.get_text(strip=True) == 'Surface':
+                return True
+        return False
+    surfaces = []
+    for index in tournaments_df.index:
+        name, id = index[0], tournaments_df.loc[index, 'Id'].iloc[0]
+        url = 'https://www.atptour.com/en/tournaments/%s/%d/overview' % (name, id)
+        t_page = requests.get(url).text
+        print(url)
+        soup = BeautifulSoup(t_page, features="lxml")
+        surface = ""
+        for tag in soup.find_all(custom_selector):
+            print(tag)
+            tag = str(tag)
+            content = tag[tag.find('>') + 1:tag.find('</div')]
+            if content in ['Hard', 'Clay', 'Grass']:
+                surface = content
+        if surface == "":
+            print(index)
+        surfaces.append(surface)
+        break
+    tournaments_df['Surface'] = surfaces
