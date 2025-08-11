@@ -1,1 +1,7 @@
+# Ignore Data folder
 Data/
+
+# Ignore all .log files
+*.log
+
+*.pyc
