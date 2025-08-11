@@ -10,47 +10,84 @@ from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
+import asyncio
+from playwright.async_api import async_playwright
 from bs4 import BeautifulSoup
 
 
 def collect_tourney_data(index, tournaments_df) -> pd.DataFrame:
+    # (You probably want to configure logging once at program start, not per-call.)
     logging.basicConfig(
-    level=logging.INFO,                          # Minimum log level
-    format='%(asctime)s - %(levelname)s - %(message)s',  # Log format
-    filename='adding_players.log',                          # Optional: log to a file
-    filemode='w'                                 # Optional: 'w' to overwrite, 'a' to append
+        level=logging.INFO,
+        format='%(asctime)s - %(levelname)s - %(message)s',
+        filename='adding_players.log',
+        filemode='w'
     )
-    name, id, year = index[0].lower(), tournaments_df.loc[index, 'Id'].iloc[0], index[1]
-    url = "https://www.atptour.com/en/scores/archive/%s/%s/%d/results" % (name, id, year)
+
+    name, id_, year = index[0].lower(), tournaments_df.loc[index, 'Id'].iloc[0], index[1]
+    url = f"https://www.atptour.com/en/scores/archive/{name}/{id_}/{int(year)}/results"
     print(url)
+
     try:
-        page = requests.get(url, timeout = 10).text
+        page = requests.get(url, timeout=10).text
     except Exception as e:
-        logging.error(f'Collecting match data for {(name, id, year)} failed with error {str(e)}')
+        logging.error(f'Collecting match data for {(name, id_, year)} failed with error {str(e)}')
         return None
-    soup = BeautifulSoup(page, features="lxml")
 
-    def match_selector(tag):
-        return tag.name == 'div' and tag.has_attr('class') and 'match-stats' in tag['class']
-    
-    def player_selector(tag):
-        return tag.name == 'a' and tag.has_attr('href')
-    
-    match_tags = soup.find_all(match_selector)
+    soup = BeautifulSoup(page, "lxml")
 
-    player1, player2, winners = [], [], []
-    for match_tag in match_tags:
-        players = [player_tag.text for player_tag in match_tag.find_all(player_selector)]
-        if players == []:
+    # Each match is contained in a div.match which has a header (round) and content (players)
+    match_nodes = soup.select("div.match")
+
+    p1_list, p2_list, winner_list, round_list = [], [], [], []
+
+    for m in match_nodes:
+        # Round text: <div class="match-header"><span><strong>Finals - </strong></span> ...
+        round_el = m.select_one("div.match-header strong")
+        round_txt = (round_el.get_text(strip=True) if round_el else "").strip()
+        # Clean "Finals -", "Quarterfinals -" etc -> remove trailing "- ..."
+        if round_txt.endswith('-'):
+            round_txt = round_txt[:-1].strip()
+        # Some pages encode rounds like "R32 -", keep as-is but strip the dash
+        round_txt = round_txt.split(' -', 1)[0].strip()
+
+        # Players: two <a> links inside this match block that point to /players/
+        # (more robust than a generic <a>)
+        player_links = m.select('a[href*="/players/"]')
+        players = [a.get_text(strip=True) for a in player_links]
+        if len(players) < 2:
+            # Fallback: try any <a> if player links weren't matched
+            players = [a.get_text(strip=True) for a in m.select('a')]
+
+        if len(players) < 2:
+            continue  # skip malformed blocks
+
+        # Some rows include “Bye”
+        if players[1].lower() == 'bye':
             continue
-        player1.append(players[0])
-        player2.append(players[1])
-        winners.append(players[0])
-        
-    df = pd.DataFrame({'Player 1' : player1, 'Player 2' : player2, 'Winner' : winners})
+
+        # On the results archive, the first listed name is the winner.
+        p1_list.append(players[0])
+        p2_list.append(players[1])
+        winner_list.append(players[0])
+        round_list.append(round_txt if round_txt else None)
+
+    if not p1_list:
+        return None
+
+    df = pd.DataFrame({
+        'Player 1': p1_list,
+        'Player 2': p2_list,
+        'Winner': winner_list,
+        'Round': round_list
+    })
+
     df['Tournament Name'] = name.title()
-    df = df[df['Player 2'] != 'Bye']
-    df['Year'] = year
+    df['Year'] = int(year)
+
+    # Final tidy
+    df = df[df['Player 2'].str.lower() != 'bye'].reset_index(drop=True)
+
     return df
 
 def add_players(index, tournaments_df):
@@ -149,59 +186,6 @@ def collect_tournaments(year):
     tournaments = pd.DataFrame({'Name' : names, 'Id' : numbers, 'Start Date' : start_dates, 'End Date' : end_dates})
     return tournaments
 
-async def collect_rankings(name, players_df):
-    try:
-        url_name, player_id = name.lower().replace(" ", '-'), players_df.loc[name, 'Id']
-    except Exception as e:
-        print(e)
-        return -1
-    ranking_page_url = 'https://www.atptour.com/en/players/%s/%s/rankings-history?year=all' % (url_name, player_id)
-
-    # Setup Chrome in headless mode
-    options = Options()
-    options.add_argument("--headless")
-    driver = webdriver.Chrome(options=options)
-
-    try:
-        driver.get(ranking_page_url)
-        # Wait for the rankings table items to load
-        WebDriverWait(driver, 20).until(
-            EC.presence_of_element_located((By.CSS_SELECTOR, "div.ranking-item"))
-        )
-        # Get page source after JS execution
-        html = driver.page_source
-
-        # Parse with BeautifulSoup
-        soup = BeautifulSoup(html, "html.parser")
-        ranking_items = soup.select("div.ranking-item")
-
-        ranks, dates = [], []
-
-        for item in ranking_items:
-            type_ = item.select_one("dd.type")
-            if type_ and type_.get_text(strip=True) != "Singles":
-                continue  # Skip doubles
-
-            date = item.select_one("dd.name span")
-            rank = item.select_one("dd.points div.set-points div")
-
-            date_text = date.get_text(strip=True) if date else "N/A"
-            rank_text = rank.get_text(strip=True) if rank else "N/A"
-
-            dates.append(pd.to_datetime(date_text).date())
-            ranks.append(int(rank_text))
-
-        df = pd.DataFrame()
-        df['Player'] = [name] * (len(dates))
-        df['Date'] = dates
-        df['Rank'] = ranks
-    except Exception as e:
-        print("Error:", e)
-        return None
-    finally:
-        driver.quit()
-    return df.drop_duplicates(subset='Date')
-
 async def add_surfaces(tournaments_df):
     surfaces = []
     for index in tqdm_asyncio(tournaments_df.index.unique(), desc="Collecting player rankings"):
@@ -230,34 +214,6 @@ async def add_surfaces(tournaments_df):
             driver.quit()
     tournaments_df['Surface'] = surfaces
     return tournaments_df
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-# pip install playwright tqdm pandas
-# python -m playwright install chromium
-
-import asyncio
-from playwright.async_api import async_playwright
-import pandas as pd
-from tqdm.asyncio import tqdm_asyncio
 
 ATP_TMPL = "https://www.atptour.com/en/players/{slug}/{pid}/rankings-history?year=all"
 
@@ -329,3 +285,56 @@ async def collect_all_rankings(players_df: pd.DataFrame, max_concurrency: int = 
     out = pd.DataFrame(flat).drop_duplicates(subset=["Player", "Date"]).sort_values(["Player", "Date"])
     return out
 
+# # OLD FUNCTIONS
+# async def collect_rankings(name, players_df):
+#     try:
+#         url_name, player_id = name.lower().replace(" ", '-'), players_df.loc[name, 'Id']
+#     except Exception as e:
+#         print(e)
+#         return -1
+#     ranking_page_url = 'https://www.atptour.com/en/players/%s/%s/rankings-history?year=all' % (url_name, player_id)
+
+#     # Setup Chrome in headless mode
+#     options = Options()
+#     options.add_argument("--headless")
+#     driver = webdriver.Chrome(options=options)
+
+#     try:
+#         driver.get(ranking_page_url)
+#         # Wait for the rankings table items to load
+#         WebDriverWait(driver, 20).until(
+#             EC.presence_of_element_located((By.CSS_SELECTOR, "div.ranking-item"))
+#         )
+#         # Get page source after JS execution
+#         html = driver.page_source
+
+#         # Parse with BeautifulSoup
+#         soup = BeautifulSoup(html, "html.parser")
+#         ranking_items = soup.select("div.ranking-item")
+
+#         ranks, dates = [], []
+
+#         for item in ranking_items:
+#             type_ = item.select_one("dd.type")
+#             if type_ and type_.get_text(strip=True) != "Singles":
+#                 continue  # Skip doubles
+
+#             date = item.select_one("dd.name span")
+#             rank = item.select_one("dd.points div.set-points div")
+
+#             date_text = date.get_text(strip=True) if date else "N/A"
+#             rank_text = rank.get_text(strip=True) if rank else "N/A"
+
+#             dates.append(pd.to_datetime(date_text).date())
+#             ranks.append(int(rank_text))
+
+#         df = pd.DataFrame()
+#         df['Player'] = [name] * (len(dates))
+#         df['Date'] = dates
+#         df['Rank'] = ranks
+#     except Exception as e:
+#         print("Error:", e)
+#         return None
+#     finally:
+#         driver.quit()
+#     return df.drop_duplicates(subset='Date')
