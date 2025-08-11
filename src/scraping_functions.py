@@ -203,7 +203,7 @@ async def collect_rankings(name, players_df):
         driver.quit()
     return df.drop_duplicates(subset='Date')
 
-def add_surfaces(tournaments_df):
+async def add_surfaces(tournaments_df):
     def custom_selector(tag):
         # Check if tag is an <li>
         if tag.name == 'li':
@@ -216,18 +216,28 @@ def add_surfaces(tournaments_df):
     for index in tournaments_df.index:
         name, id = index[0], tournaments_df.loc[index, 'Id'].iloc[0]
         url = 'https://www.atptour.com/en/tournaments/%s/%d/overview' % (name, id)
-        t_page = requests.get(url).text
         print(url)
-        soup = BeautifulSoup(t_page, features="lxml")
-        surface = ""
-        for tag in soup.find_all(custom_selector):
-            print(tag)
-            tag = str(tag)
-            content = tag[tag.find('>') + 1:tag.find('</div')]
+        options = Options()
+        options.add_argument("--headless")
+        driver = webdriver.Chrome(options=options)
+        surface = None
+        try:
+            driver.get(url)
+            # Wait for both 'Surface' span and its next sibling to exist
+            next_span_elem = WebDriverWait(driver, 20).until(
+                EC.presence_of_element_located(
+                    (By.XPATH, "//span[normalize-space()='Surface']/following-sibling::span[1]")
+                )
+            )
+            # Get the text of that next span
+            content = next_span_elem.text
             if content in ['Hard', 'Clay', 'Grass']:
                 surface = content
-        if surface == "":
-            print(index)
-        surfaces.append(surface)
-        break
+            print(f"Tournament Surface: {surface}")
+            surfaces.append(surface)
+        except Exception as e:
+            print(e)
+        finally:
+            driver.quit()
     tournaments_df['Surface'] = surfaces
+    return tournaments_df
