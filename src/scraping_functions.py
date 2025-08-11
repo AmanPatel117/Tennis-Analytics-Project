@@ -203,14 +203,6 @@ async def collect_rankings(name, players_df):
     return df.drop_duplicates(subset='Date')
 
 async def add_surfaces(tournaments_df):
-    def custom_selector(tag):
-        # Check if tag is an <li>
-        if tag.name == 'li':
-            # Look for a <span> child with exact text 'Surface'
-            span = tag.find('span')
-            if span and span.get_text(strip=True) == 'Surface':
-                return True
-        return False
     surfaces = []
     for index in tqdm_asyncio(tournaments_df.index.unique(), desc="Collecting player rankings"):
         name, id = index[0], tournaments_df.loc[index, 'Id'].iloc[0]
@@ -231,7 +223,6 @@ async def add_surfaces(tournaments_df):
             content = next_span_elem.text
             if content in ['Hard', 'Clay', 'Grass']:
                 surface = content
-            print(f"Tournament Surface: {surface}")
             surfaces.append(surface)
         except Exception as e:
             print(e)
