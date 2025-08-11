@@ -118,72 +118,89 @@ def add_players(index, tournaments_df):
 
 def collect_tournaments(year):
     logging.basicConfig(
-    level=logging.INFO,                          # Minimum log level
-    format='%(asctime)s - %(levelname)s - %(message)s',  # Log format
-    filename='app.log',                          # Optional: log to a file
-    filemode='w'                                 # Optional: 'w' to overwrite, 'a' to append
+        level=logging.INFO,
+        format='%(asctime)s - %(levelname)s - %(message)s',
+        filename='app.log',
+        filemode='w'
     )
 
-    tournaments_page = 'https://www.atptour.com/en/scores/results-archive?year=%d' % (year)
-    tags, names, numbers, start_dates, end_dates = [], [], [], [], []
-    page = requests.get(tournaments_page).text
+    tournaments_page = f'https://www.atptour.com/en/scores/results-archive?year={int(year)}'
+    tags, names, numbers, start_dates, end_dates, num_rounds = [], [], [], [], [], []
 
-    start = page.find('<select id="tournament"')
-    tournament_string = page[start:]
-    end = tournament_string.find('</select>')
-
-    tournament_string = tournament_string[:end]
+    page = requests.get(tournaments_page, timeout=15).text
     soup = BeautifulSoup(page, features="lxml")
 
-    def custom_selector(tag):
-        if tag.name == 'option' and tag.has_attr("value") and tag.has_attr('class'):
-            return True
-        return False
-    for tag in soup.find_all(custom_selector):
+    # Options in the tournaments selector carry the tournament id
+    def tournament_option(tag):
+        return tag.name == 'option' and tag.has_attr("value") and tag.has_attr('class')
+
+    for tag in soup.find_all(tournament_option):
         tags.append(tag)
+
     for tag in tags:
         url_number = int(tag.get('value'))
-        tag = str(tag)
-        tag = tag[tag.find('>') + 1:]
-        name = tag[:tag.find('<')].strip().title()
+        t = str(tag)
+        t = t[t.find('>') + 1:]
+        name = t[:t.find('<')].strip().title()
         names.append(name)
         numbers.append(url_number)
 
     for i in range(len(names)):
         name, num = names[i], numbers[i]
-        name = name.replace(" ", "-")
-        url = 'https://www.atptour.com/en/scores/archive/%s/%s/%s/results' % (name, num, year)
+        name_slug = name.replace(" ", "-")
+        url = f'https://www.atptour.com/en/scores/archive/{name_slug}/{num}/{int(year)}/results'
+
         try:
-            page = requests.get(url, timeout = 10).text
-            soup1 = BeautifulSoup(page, features="html.parser")
+            page = requests.get(url, timeout=15).text
+            soup1 = BeautifulSoup(page, features="lxml")
+
+            # --- Dates ---
             date_location = soup1.find_all('div', class_='date-location')[1]
+            text = date_location.get_text(strip=True)
+            m1 = re.search(r'(\d{1,2} \w{3}) - (\d{1,2} \w{3}), (\d{4})', text)
+            m2 = re.search(r'(\d{1,2})-(\d{1,2}) (\w{3}), (\d{4})', text)
+
+            if m1:
+                start_day, end_day, y = m1.group(1), m1.group(2), m1.group(3)
+                start_date = f"{start_day}, {y}"
+                end_date   = f"{end_day}, {y}"
+            elif m2:
+                sd, ed, month, y = m2.group(1), m2.group(2), m2.group(3), m2.group(4)
+                start_date = f"{sd} {month}, {y}"
+                end_date   = f"{ed} {month}, {y}"
+            else:
+                raise ValueError("Date format could not be parsed. Check website and add regex.")
+
+            start_dates.append(datetime.strptime(start_date, "%d %b, %Y"))
+            end_dates.append(datetime.strptime(end_date, "%d %b, %Y"))
+
+            # --- Number of Rounds (main draw only) ---
+            sel = soup1.select_one('select#matchRound-filter')
+            if sel:
+                options = [
+                    o for o in sel.find_all('option')
+                    if not re.match(r'^Q\d', o.get('value', '').upper())  # exclude Q1, Q2, etc., but keep QF
+                ]
+                # Subtract 1 for "Round (All)" option
+                count = max(len(options) - 1, 0)
+            else:
+                count = None
+
+            num_rounds.append(count)
+
         except Exception as e:
             logging.error(f'Scraping failed for {(name, num, year)} with error {str(e)}')
+            start_dates.append(pd.NaT)
+            end_dates.append(pd.NaT)
+            num_rounds.append(None)
 
-        text = date_location.get_text(strip=True)
-        # Regex to match patterns like: 27 Feb - 4 Mar, 2023
-        match = re.search(r'(\d{1,2} \w{3}) - (\d{1,2} \w{3}), (\d{4})', text)
-
-        match2 = re.search(r'(\d{1,2})-(\d{1,2}) (\w{3}), (\d{4})', text)
-        
-        if match:
-            start_day = match.group(1)
-            end_day = match.group(2)
-            year = match.group(3)
-            start_date = f"{start_day}, {year}"
-            end_date = f"{end_day}, {year}"
-        elif match2:
-            start_day = match2.group(1)
-            end_day = match2.group(2)
-            month = match2.group(3)
-            year = match2.group(4)
-            start_date = f"{start_day} {month}, {year}"
-            end_date = f"{end_day} {month}, {year}"
-        else:
-            raise Exception("Date format could not be parsed. Check website and add regex.")
-        start_dates.append(datetime.strptime(start_date, "%d %b, %Y"))
-        end_dates.append(datetime.strptime(end_date, "%d %b, %Y"))
-    tournaments = pd.DataFrame({'Name' : names, 'Id' : numbers, 'Start Date' : start_dates, 'End Date' : end_dates})
+    tournaments = pd.DataFrame({
+        'Name': names,
+        'Id': numbers,
+        'Start Date': start_dates,
+        'End Date': end_dates,
+        'Number of Rounds': num_rounds,
+    })
     return tournaments
 
 async def add_surfaces(tournaments_df):
