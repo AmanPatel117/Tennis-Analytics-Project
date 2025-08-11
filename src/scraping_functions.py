@@ -230,3 +230,102 @@ async def add_surfaces(tournaments_df):
             driver.quit()
     tournaments_df['Surface'] = surfaces
     return tournaments_df
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+# pip install playwright tqdm pandas
+# python -m playwright install chromium
+
+import asyncio
+from playwright.async_api import async_playwright
+import pandas as pd
+from tqdm.asyncio import tqdm_asyncio
+
+ATP_TMPL = "https://www.atptour.com/en/players/{slug}/{pid}/rankings-history?year=all"
+
+def slugify(name: str) -> str:
+    return name.lower().replace(" ", "-")
+
+async def _fetch_player_rankings(name: str, pid: str, context, timeout_ms=20000):
+    """Open one page, extract Singles ranking rows, return list[dict]."""
+    url = ATP_TMPL.format(slug=slugify(name), pid=pid)
+    page = await context.new_page()
+    try:
+        await page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
+        # Wait for the ranking items to exist (page is dynamic)
+        await page.wait_for_selector("div.ranking-item", timeout=timeout_ms)
+
+        # Extract on the page (JS side) to avoid HTML round‑trips
+        rows = await page.eval_on_selector_all(
+            "div.ranking-item",
+            """els => els.map(el => {
+                const type = el.querySelector('dd.type')?.textContent?.trim();
+                if (type && type !== 'Singles') return null;
+                const d = el.querySelector('dd.name span')?.textContent?.trim();
+                const r = el.querySelector('dd.points div.set-points div')?.textContent?.trim();
+                if (!d || !r) return null;
+                const rank = parseInt(String(r).replace(/[^0-9]/g, ''), 10);
+                if (Number.isNaN(rank)) return null;
+                return {date: d, rank};
+            }).filter(Boolean)"""
+        )
+        # Build pandas-friendly records
+        recs = [{"Player": name, "Date": pd.to_datetime(r["date"]).date(), "Rank": r["rank"]} for r in rows]
+        return recs
+    except Exception as e:
+        # return empty list to keep the pipeline moving
+        # you can log `e` if you want
+        return []
+    finally:
+        await page.close()
+
+async def collect_all_rankings(players_df: pd.DataFrame, max_concurrency: int = 8):
+    """
+    players_df: index is player name; must have column 'Id'
+    Returns a DataFrame with columns: Player, Date, Rank
+    """
+    names = players_df.index.unique().tolist()
+    ids = players_df.loc[names, "Id"].astype(str).tolist()
+
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(headless=True)
+        context = await browser.new_context()
+
+        sem = asyncio.Semaphore(max_concurrency)
+
+        async def runner(name, pid):
+            async with sem:
+                return await _fetch_player_rankings(name, pid, context)
+
+        tasks = [runner(n, i) for n, i in zip(names, ids)]
+        # tqdm on asyncio
+        results_nested = await tqdm_asyncio.gather(*tasks, desc="Collecting rankings", total=len(tasks))
+
+        await context.close()
+        await browser.close()
+
+    # Flatten and build one DataFrame once (fast)
+    flat = [row for recs in results_nested for row in recs]
+    if not flat:
+        return pd.DataFrame(columns=["Player", "Date", "Rank"])
+    out = pd.DataFrame(flat).drop_duplicates(subset=["Player", "Date"]).sort_values(["Player", "Date"])
+    return out
+
