@@ -3,7 +3,7 @@ from bs4 import BeautifulSoup
 import pandas as pd
 import re
 from datetime import datetime
-import random
+from tqdm.asyncio import tqdm_asyncio
 import logging
 from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
@@ -115,7 +115,6 @@ def collect_tournaments(year):
     for i in range(len(names)):
         name, num = names[i], numbers[i]
         name = name.replace(" ", "-")
-        print(name, num, year)
         url = 'https://www.atptour.com/en/scores/archive/%s/%s/%s/results' % (name, num, year)
         try:
             page = requests.get(url, timeout = 10).text
@@ -213,10 +212,9 @@ async def add_surfaces(tournaments_df):
                 return True
         return False
     surfaces = []
-    for index in tournaments_df.index:
+    for index in tqdm_asyncio(tournaments_df.index.unique(), desc="Collecting player rankings"):
         name, id = index[0], tournaments_df.loc[index, 'Id'].iloc[0]
         url = 'https://www.atptour.com/en/tournaments/%s/%d/overview' % (name, id)
-        print(url)
         options = Options()
         options.add_argument("--headless")
         driver = webdriver.Chrome(options=options)
