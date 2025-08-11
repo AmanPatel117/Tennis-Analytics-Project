@@ -106,7 +106,6 @@ def add_players(index, tournaments_df):
         return None
     page = page[page.find('<option selected="selected" value="">Player (All)</option>'):]
     page = page[:page.find('</select>')]
-
     soup = BeautifulSoup(page, features="lxml")
 
     def custom_selector(tag):
