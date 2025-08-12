@@ -3,6 +3,7 @@ from bs4 import BeautifulSoup
 import pandas as pd
 import re
 from datetime import datetime
+from tqdm import tqdm
 from tqdm.asyncio import tqdm_asyncio
 import logging
 from selenium import webdriver
@@ -13,6 +14,7 @@ from selenium.webdriver.support import expected_conditions as EC
 import asyncio
 from playwright.async_api import async_playwright
 from bs4 import BeautifulSoup
+import time
 
 
 def collect_tourney_data(index, tournaments_df) -> pd.DataFrame:
@@ -26,7 +28,6 @@ def collect_tourney_data(index, tournaments_df) -> pd.DataFrame:
 
     name, id_, year = index[0].lower(), tournaments_df.loc[index, 'Id'].iloc[0], index[1]
     url = f"https://www.atptour.com/en/scores/archive/{name}/{id_}/{int(year)}/results"
-    print(url)
 
     try:
         page = requests.get(url, timeout=10).text
@@ -202,155 +203,236 @@ def collect_tournaments(year):
     })
     return tournaments
 
-async def add_surfaces(tournaments_df):
-    surfaces = []
-    for index in tqdm_asyncio(tournaments_df.index.unique(), desc="Collecting player rankings"):
-        name, id = index[0], tournaments_df.loc[index, 'Id'].iloc[0]
-        url = 'https://www.atptour.com/en/tournaments/%s/%d/overview' % (name, id)
-        options = Options()
-        options.add_argument("--headless")
-        driver = webdriver.Chrome(options=options)
-        surface = None
-        try:
-            driver.get(url)
-            # Wait for both 'Surface' span and its next sibling to exist
-            next_span_elem = WebDriverWait(driver, 20).until(
-                EC.presence_of_element_located(
-                    (By.XPATH, "//span[normalize-space()='Surface']/following-sibling::span[1]")
-                )
-            )
-            # Get the text of that next span
-            content = next_span_elem.text
-            if content in ['Hard', 'Clay', 'Grass']:
-                surface = content
-            surfaces.append(surface)
-        except Exception as e:
-            print(e)
-        finally:
-            driver.quit()
-    tournaments_df['Surface'] = surfaces
-    return tournaments_df
-
-ATP_TMPL = "https://www.atptour.com/en/players/{slug}/{pid}/rankings-history?year=all"
-
-def slugify(name: str) -> str:
+def _slugify(name: str) -> str:
     return name.lower().replace(" ", "-")
 
-async def _fetch_player_rankings(name: str, pid: str, context, timeout_ms=20000):
-    """Open one page, extract Singles ranking rows, return list[dict]."""
-    url = ATP_TMPL.format(slug=slugify(name), pid=pid)
-    page = await context.new_page()
+def collect_all_rankings(players_df, print_sample=True, sample_rows=8):
+    # --- small, safe speed-ups ---
+    options = Options()
+    options.add_argument("--headless=new")                     # faster headless
+    options.add_argument("--disable-gpu")
+    options.add_argument("--no-sandbox")
+    options.add_argument("--disable-dev-shm-usage")
+    options.add_argument("--blink-settings=imagesEnabled=false")
+    options.set_capability("pageLoadStrategy", "none")         # we’ll wait for the bits we need
+
+    driver = webdriver.Chrome(options=options)
+    driver.set_page_load_timeout(12)
+
+    wait = WebDriverWait(driver, 10)
+
+    # avoid per-iteration .loc cost
+    name_to_id = players_df["Id"].to_dict()
+    names = list(players_df.index)
+
+    all_frames = []
+    printed_sample = False
+
     try:
-        await page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
-        # Wait for the ranking items to exist (page is dynamic)
-        await page.wait_for_selector("div.ranking-item", timeout=timeout_ms)
+        for name in tqdm(names, desc="Collecting rankings", unit="player"):
+            pid = name_to_id.get(name)
+            if not pid:
+                continue
 
-        # Extract on the page (JS side) to avoid HTML round‑trips
-        rows = await page.eval_on_selector_all(
-            "div.ranking-item",
-            """els => els.map(el => {
-                const type = el.querySelector('dd.type')?.textContent?.trim();
-                if (type && type !== 'Singles') return null;
-                const d = el.querySelector('dd.name span')?.textContent?.trim();
-                const r = el.querySelector('dd.points div.set-points div')?.textContent?.trim();
-                if (!d || !r) return null;
-                const rank = parseInt(String(r).replace(/[^0-9]/g, ''), 10);
-                if (Number.isNaN(rank)) return null;
-                return {date: d, rank};
-            }).filter(Boolean)"""
-        )
-        # Build pandas-friendly records
-        recs = [{"Player": name, "Date": pd.to_datetime(r["date"]).date(), "Rank": r["rank"]} for r in rows]
-        return recs
-    except Exception as e:
-        # return empty list to keep the pipeline moving
-        # you can log `e` if you want
-        return []
+            url = f"https://www.atptour.com/en/players/{_slugify(name)}/{pid}/rankings-history?year=all"
+
+            rows_collected = False
+            for attempt in (1, 2):  # tiny retry for flaky hydration
+                try:
+                    driver.get(url)
+
+                    # Wait for nested cells, not just the row shell. This reduces "None/0" issues.
+                    wait.until(EC.presence_of_all_elements_located(
+                        (By.CSS_SELECTOR, "div.ranking-item dd.name span")
+                    ))
+                    wait.until(EC.presence_of_all_elements_located(
+                        (By.CSS_SELECTOR, "div.ranking-item dd.points div.set-points div")
+                    ))
+
+                    # Small buffer to let text populate (keeps fast pages fast, helps slow ones)
+                    time.sleep(0.15 if attempt == 1 else 0.35)
+
+                    html = driver.page_source
+                    soup = BeautifulSoup(html, "lxml")  # faster; falls back to html.parser if lxml unavailable
+                    ranking_items = soup.select("div.ranking-item")
+
+                    date_strs, rank_strs = [], []
+                    for item in ranking_items:
+                        type_ = item.select_one("dd.type")
+                        if type_ and type_.get_text(strip=True) != "Singles":
+                            continue
+
+                        date = item.select_one("dd.name span")
+                        rank = item.select_one("dd.points div.set-points div")
+
+                        if not (date and rank):
+                            continue
+
+                        dtxt = date.get_text(strip=True)
+                        rtxt = rank.get_text(strip=True)
+
+                        if dtxt and rtxt:
+                            date_strs.append(dtxt)
+                            rank_strs.append(rtxt)
+
+                    if date_strs and rank_strs:
+                        # Vectorized conversions
+                        dates = pd.to_datetime(pd.Series(date_strs), errors="coerce").dt.date
+                        ranks = (
+                            pd.Series(rank_strs)
+                            .str.replace(",", "", regex=False)
+                            .pipe(pd.to_numeric, errors="coerce")
+                        )
+
+                        df = (
+                            pd.DataFrame({"Player": name, "Date": dates, "Rank": ranks})
+                              .dropna(subset=["Date", "Rank"])
+                              .drop_duplicates(subset="Date")
+                        )
+
+                        if not df.empty:
+                            all_frames.append(df)
+
+                            # Print a small sample once so you can sanity-check quickly
+                            if print_sample and not printed_sample:
+                                print("\nSample output (first player parsed):")
+                                print(df.sort_values("Date", ascending=False).head(sample_rows).to_string(index=False))
+                                printed_sample = True
+                    break  # exit retry loop even if empty (we tried)
+
+                except Exception as e:
+                    if attempt == 2:
+                        print(f"Error for player {name}: {e}")
+                    # quick retry
+                    continue
+
+            # proceed to next player
+            continue
+
     finally:
-        await page.close()
+        driver.quit()
 
-async def collect_all_rankings(players_df: pd.DataFrame, max_concurrency: int = 8):
-    """
-    players_df: index is player name; must have column 'Id'
-    Returns a DataFrame with columns: Player, Date, Rank
-    """
-    names = players_df.index.unique().tolist()
-    ids = players_df.loc[names, "Id"].astype(str).tolist()
+    return pd.concat(all_frames, ignore_index=True) if all_frames else pd.DataFrame(columns=["Player", "Date", "Rank"])
 
-    async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=True)
-        context = await browser.new_context()
-
-        sem = asyncio.Semaphore(max_concurrency)
-
-        async def runner(name, pid):
-            async with sem:
-                return await _fetch_player_rankings(name, pid, context)
-
-        tasks = [runner(n, i) for n, i in zip(names, ids)]
-        # tqdm on asyncio
-        results_nested = await tqdm_asyncio.gather(*tasks, desc="Collecting rankings", total=len(tasks))
-
-        await context.close()
-        await browser.close()
-
-    # Flatten and build one DataFrame once (fast)
-    flat = [row for recs in results_nested for row in recs]
-    if not flat:
-        return pd.DataFrame(columns=["Player", "Date", "Rank"])
-    out = pd.DataFrame(flat).drop_duplicates(subset=["Player", "Date"]).sort_values(["Player", "Date"])
-    return out
-
-# # OLD FUNCTIONS
-# async def collect_rankings(name, players_df):
-#     try:
-#         url_name, player_id = name.lower().replace(" ", '-'), players_df.loc[name, 'Id']
-#     except Exception as e:
-#         print(e)
-#         return -1
-#     ranking_page_url = 'https://www.atptour.com/en/players/%s/%s/rankings-history?year=all' % (url_name, player_id)
-
-#     # Setup Chrome in headless mode
+# def collect_all_rankings(players_df):
+#     # --- Simple, safe speed-ups ---
 #     options = Options()
-#     options.add_argument("--headless")
+#     options.add_argument("--headless=new")                     # faster headless
+#     options.add_argument("--disable-gpu")
+#     options.add_argument("--no-sandbox")
+#     options.add_argument("--disable-dev-shm-usage")
+#     options.add_argument("--blink-settings=imagesEnabled=false")  # skip images
+#     options.set_capability("pageLoadStrategy", "none")         # don't wait for full load
+
 #     driver = webdriver.Chrome(options=options)
+#     wait = WebDriverWait(driver, 12)  # a bit tighter than 20s
+
+#     all_frames = []
 
 #     try:
-#         driver.get(ranking_page_url)
-#         # Wait for the rankings table items to load
-#         WebDriverWait(driver, 20).until(
-#             EC.presence_of_element_located((By.CSS_SELECTOR, "div.ranking-item"))
-#         )
-#         # Get page source after JS execution
-#         html = driver.page_source
+#         for name in tqdm(players_df.index, desc="Collecting rankings", unit="player"):
+#             try:
+#                 url_name = name.lower().replace(" ", "-")
+#                 player_id = players_df.loc[name, "Id"]
+#                 url = f"https://www.atptour.com/en/players/{url_name}/{player_id}/rankings-history?year=all"
 
-#         # Parse with BeautifulSoup
-#         soup = BeautifulSoup(html, "html.parser")
-#         ranking_items = soup.select("div.ranking-item")
+#                 driver.get(url)
 
-#         ranks, dates = [], []
+#                 # Just wait until ranking items are present
+#                 wait.until(EC.presence_of_all_elements_located((By.CSS_SELECTOR, "div.ranking-item")))
 
-#         for item in ranking_items:
-#             type_ = item.select_one("dd.type")
-#             if type_ and type_.get_text(strip=True) != "Singles":
-#                 continue  # Skip doubles
+#                 # Parse with BeautifulSoup (keeps your existing parsing logic)
+#                 soup = BeautifulSoup(driver.page_source, "html.parser")
+#                 ranking_items = soup.select("div.ranking-item")
 
-#             date = item.select_one("dd.name span")
-#             rank = item.select_one("dd.points div.set-points div")
+#                 # Collect raw strings first (then vectorize conversion)
+#                 date_strs, rank_strs = [], []
+#                 for item in ranking_items:
+#                     type_ = item.select_one("dd.type")
+#                     if type_ and type_.get_text(strip=True) != "Singles":
+#                         continue
 
-#             date_text = date.get_text(strip=True) if date else "N/A"
-#             rank_text = rank.get_text(strip=True) if rank else "N/A"
+#                     date = item.select_one("dd.name span")
+#                     rank = item.select_one("dd.points div.set-points div")
 
-#             dates.append(pd.to_datetime(date_text).date())
-#             ranks.append(int(rank_text))
+#                     if date and rank:
+#                         dtxt = date.get_text(strip=True)
+#                         rtxt = rank.get_text(strip=True)
+#                         if dtxt and rtxt:
+#                             date_strs.append(dtxt)
+#                             rank_strs.append(rtxt)
 
-#         df = pd.DataFrame()
-#         df['Player'] = [name] * (len(dates))
-#         df['Date'] = dates
-#         df['Rank'] = ranks
-#     except Exception as e:
-#         print("Error:", e)
-#         return None
+#                 if date_strs and rank_strs:
+#                     # Vectorized conversions (faster & cleaner)
+#                     dates = pd.to_datetime(pd.Series(date_strs), errors="coerce").dt.date
+#                     ranks = pd.to_numeric(pd.Series(rank_strs).str.replace(",", ""), errors="coerce")
+
+#                     df = pd.DataFrame({"Player": name, "Date": dates, "Rank": ranks})
+#                     df = df.dropna(subset=["Date", "Rank"]).drop_duplicates(subset="Date")
+#                     print(df)
+#                     if not df.empty:
+#                         all_frames.append(df)
+
+#             except Exception as e:
+#                 print(f"Error for player {name}: {e}")
+#                 continue
 #     finally:
 #         driver.quit()
-#     return df.drop_duplicates(subset='Date')
+
+#     if all_frames:
+#         return pd.concat(all_frames, ignore_index=True)
+#     return pd.DataFrame(columns=["Player", "Date", "Rank"])
+
+# async def add_surfaces(tournaments_df):
+#     # Reuse ONE driver for the whole loops
+#     options = Options()
+#     options.add_argument("--headless=new")          # a bit faster/stabler headless
+#     options.add_argument("--disable-gpu")
+#     options.add_argument("--no-sandbox")
+#     options.add_argument("--disable-dev-shm-usage")
+#     options.add_argument("--blink-settings=imagesEnabled=false")  # don't load images
+#     options.page_load_strategy = "eager"            # don't wait for all resources
+
+#     driver = webdriver.Chrome(options=options)
+#     wait = WebDriverWait(driver, 15)
+
+#     surfaces = []
+#     try:
+#         # iterate exactly as before (your index appears to be (Name, Year))
+#         for index in tqdm(tournaments_df.index.unique(), desc="Collecting tournament surfaces"):
+#             name = index[0]
+#             tid = int(tournaments_df.loc[index, 'Id'].iloc[0])  # same as before
+        
+#             url = "https://www.atptour.com/en/tournaments/%s/%d/overview" % (name, tid)
+#             edge_cases = {'Adelaide 1' : 'Hard', 'Adelaide 2' : 'Hard', 'Adelaide' : 'Hard', 'Amersfoort' : 'Clay', 'Amsterdam' : 'Clay', 
+#                         'Bunschoten' : 'Clay'}
+#             if name in edge_cases:
+#                 surfaces.append(edge_cases[name])
+#             else:    
+#                 surface = None
+#                 try:
+#                     driver.get(url)
+#                     # Wait for the 'Surface' value span
+#                     next_span_elem = wait.until(
+#                         EC.presence_of_element_located(
+#                             (By.XPATH, "//span[normalize-space()='Surface']/following-sibling::span[1]")
+#                         )
+#                     )
+#                     content = next_span_elem.text.strip()
+#                     if content in ('Hard', 'Clay', 'Grass'):
+#                         surface = content
+#                 except Exception as e:
+#                     # keep your behavior: print and continue
+#                     print(url)
+#                     print(e)
+#                     break
+#                 finally:
+#                     print(index, surface)
+#                     surfaces.append(surface)
+
+#     finally:
+#         driver.quit()
+
+#     tournaments_df = tournaments_df.copy()
+#     tournaments_df['Surface'] = surfaces
+#     return tournaments_df
