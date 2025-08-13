@@ -1,5 +1,6 @@
 # Ignore Data folder
 Data/
+mlruns/
 
 # Ignore all .log files
 *.log
