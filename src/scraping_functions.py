@@ -227,7 +227,7 @@ def collect_all_rankings(players_df, print_sample=True, sample_rows=8):
 
     all_frames = []
     printed_sample = False
-
+    
     try:
         for name in tqdm(names, desc="Collecting rankings", unit="player"):
             pid = name_to_id.get(name)
@@ -236,7 +236,6 @@ def collect_all_rankings(players_df, print_sample=True, sample_rows=8):
 
             url = f"https://www.atptour.com/en/players/{_slugify(name)}/{pid}/rankings-history?year=all"
 
-            rows_collected = False
             for attempt in (1, 2):  # tiny retry for flaky hydration
                 try:
                     driver.get(url)
@@ -296,7 +295,7 @@ def collect_all_rankings(players_df, print_sample=True, sample_rows=8):
                             # Print a small sample once so you can sanity-check quickly
                             if print_sample and not printed_sample:
                                 print("\nSample output (first player parsed):")
-                                print(df.sort_values("Date", ascending=False).head(sample_rows).to_string(index=False))
+                                print(df.sort_values("Date", ascending=False).tail(sample_rows).to_string(index=False))
                                 printed_sample = True
                     break  # exit retry loop even if empty (we tried)
 
